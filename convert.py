@@ -39,6 +39,31 @@ class AssetType(IntEnum):
     ScreenshotEnd = 24
     Max = 24
 
+    @property
+    def required_dimensions(self) -> Tuple[int, int]:
+        """Get required dimensions for each asset type"""
+        dimensions = {
+            AssetType.Icon: (64, 64),
+            AssetType.Banner: (420, 96),
+            AssetType.Boxart: (900, 600),
+            AssetType.Slot: (128, 128),  # Add slot dimensions
+            AssetType.Background: (1280, 720),
+            # Screenshots use the same dimensions
+        }
+        return dimensions.get(self, (1000, 562))  # Default to screenshot size
+
+class AssetError(Exception):
+    """Base exception for all asset-related errors"""
+    pass
+
+class ImageProcessingError(AssetError):
+    """Raised when image processing fails"""
+    pass
+
+class AssetConversionError(AssetError):
+    """Raised when asset conversion fails"""
+    pass
+
 class AuroraAssetFile:
     MAGIC = 0x52584541  # 'AXER' in ASCII
     VERSION = 1
@@ -53,7 +78,7 @@ class AuroraAssetFile:
             self.converter = AuroraDLL(dll_path)
         except Exception as e:
             print(f"Failed to initialize converter: {e}")
-            print("\nPlease ensure:")
+            print(" Please ensure:")
             print("1. The AuroraAsset.dll file is in the same directory as the script")
             print("2. You're using the correct version (32/64-bit) of the DLL for your Python installation")
             print("3. The DLL is accessible and not blocked by your system")
@@ -70,8 +95,18 @@ class AuroraAssetFile:
         offset = self.HEADER_SIZE + (len(self.entries) * self.ENTRY_SIZE)
         return offset + (self.ALIGNMENT - (offset % self.ALIGNMENT))
 
-    def import_image(self, image_path: str, asset_type: AssetType = AssetType.Background, compression: bool = True, verbose: bool = False) -> bool:
+    def _update_screenshot_count(self) -> None:
+        """Update screenshot count based on valid screenshot entries"""
+        max_screenshot = 0
+        for i in range(AssetType.ScreenshotStart, AssetType.ScreenshotEnd + 1):
+            if len(self.entries[i]['video_data']) > 0:
+                max_screenshot = max(max_screenshot, i - AssetType.ScreenshotStart + 1)
+        self.screenshot_count = max_screenshot
+
+    def import_image(self, image_path: str, asset_type: AssetType, compression: bool = True, verbose: bool = False) -> bool:
         try:
+            if not os.path.exists(image_path):
+                raise ImageProcessingError(f"Image file not found: {image_path}")
             # Open and convert image to RGBA
             with Image.open(image_path) as img:
                 # Auto-resize logic
@@ -119,8 +154,7 @@ class AuroraAssetFile:
                         self.flags |= 0x01  # Set icon/banner flag
                     elif AssetType.ScreenshotStart <= asset_type <= AssetType.ScreenshotEnd:
                         self.flags |= (1 << asset_type.value)
-                        self.screenshot_count = max(self.screenshot_count, 
-                                                 asset_type.value - AssetType.ScreenshotStart + 1)
+                        self._update_screenshot_count()
 
                     # Store the data
                     self.entries[entry_idx]['texture_header'] = bytearray(header)
@@ -129,43 +163,40 @@ class AuroraAssetFile:
                         print(f"Successfully imported {asset_type.name} to entry {entry_idx}")
                 return success
         except Exception as e:
-            print(f"Error importing image: {e}")
-            return False
+            raise AssetConversionError(f"Failed to import image: {str(e)}")
 
     def save_asset(self, output_path: str, verbose: bool = False) -> bool:
         try:
             with open(output_path, 'wb') as f:
                 # Write header
                 data_size = sum(len(entry['video_data']) for entry in self.entries)
-                f.write(struct.pack('<I', self._swap_uint32(self.MAGIC)))  # Magic
-                f.write(struct.pack('<I', self._swap_uint32(self.VERSION)))  # Version
-                f.write(struct.pack('<I', self._swap_uint32(data_size)))  # Data size
-                f.write(struct.pack('<I', self._swap_uint32(self.flags)))  # Flags
-                f.write(struct.pack('<I', self._swap_uint32(self.screenshot_count)))  # Screenshot count
+                f.write(struct.pack('>I', self.MAGIC))  # AXER in big-endian
+                f.write(struct.pack('<I', self.VERSION))
+                f.write(struct.pack('<I', data_size))
+                f.write(struct.pack('<I', self.flags))
+                f.write(struct.pack('<I', self.screenshot_count))
 
-                # Write entry table
-                offset = 0
+                # Write entry table (25 entries * 64 bytes)
                 for entry in self.entries:
-                    size = len(entry['video_data'])
-                    f.write(struct.pack('<I', self._swap_uint32(offset)))  # Offset
-                    f.write(struct.pack('<I', self._swap_uint32(size)))  # Size
+                    # Always write offset as 0 as seen in working files
+                    f.write(struct.pack('<I', 0))  # Offset
+                    f.write(struct.pack('<I', len(entry['video_data'])))  # Size
                     f.write(struct.pack('<I', 0))  # Extended info
-                    f.write(entry['texture_header'])  # Texture header
-                    # Keep offset at 0 as seen in working file
+                    f.write(entry['texture_header'])  # 52 bytes texture header
 
                 # Write padding to align to 2048 bytes
                 current_pos = f.tell()
-                padding_size = (self.ALIGNMENT - (current_pos % self.ALIGNMENT)) % self.ALIGNMENT
-                f.write(bytearray(padding_size))
+                padding_size = 2048 - (current_pos % 2048)
+                f.write(b'\x00' * padding_size)
 
-                # Write video data
+                # Write actual texture data
                 for entry in self.entries:
-                    if entry['video_data']:
+                    if len(entry['video_data']) > 0:
                         f.write(entry['video_data'])
+
                 return True
         except Exception as e:
-            print(f"Error saving asset: {e}")
-            return False
+            raise AssetConversionError(f"Failed to save asset: {str(e)}")
 
     def extract_image(self, asset_path: str, asset_type: AssetType = AssetType.Icon) -> Optional[Image.Image]:
         try:
@@ -216,6 +247,26 @@ class AuroraAssetFile:
         except Exception as e:
             print(f"Error extracting image: {e}")
             return None
+
+    def validate_image_size(self, img: Image.Image, asset_type: AssetType) -> None:
+        """Validate image dimensions for specific asset types"""
+        width, height = img.size
+        
+        if asset_type == AssetType.Icon:
+            if width != 64 or height != 64:
+                raise ImageProcessingError(f"Icon must be 64x64 pixels, got {width}x{height}")
+        elif asset_type == AssetType.Banner:
+            if width != 420 or height != 96:
+                raise ImageProcessingError(f"Banner must be 420x96 pixels, got {width}x{height}")
+        elif asset_type == AssetType.Boxart:
+            if width != 900 or height != 600:
+                raise ImageProcessingError(f"Boxart must be 900x600 pixels, got {width}x{height}")
+        elif asset_type == AssetType.Background:
+            if width != 1280 or height != 720:
+                raise ImageProcessingError(f"Background must be 1280x720 pixels, got {width}x{height}")
+        elif AssetType.ScreenshotStart <= asset_type <= AssetType.ScreenshotEnd:
+            if width != 1000 or height != 562:
+                raise ImageProcessingError(f"Screenshots must be 1000x562 pixels, got {width}x{height}")
 
 def ensure_prefix(output_path: str, asset_type: AssetType) -> str:
     """Ensure the output file has the correct prefix for its type."""
@@ -286,24 +337,35 @@ def handle_background(args):
     if asset.import_image(args.image, AssetType.Background):
         output_path = f"BK{args.titleid}.asset"
         if asset.save_asset(output_path):
-            print(f"\nCreated background asset: {output_path}")
+            # if verbose, print the full path else just the filename
+            if args.verbose:
+                print(f"Created background asset: {output_path}")
+            else:
+                print(f"Created background asset: {os.path.basename(output_path)}")
         else:
-            print("\nFailed to save background asset")
+            print("Failed to save background asset")
+
+
     else:
-        print("\nFailed to import background image")
+        print("Failed to import background image")
+
 
 def handle_boxart(args):
     asset = AuroraAssetFile(verbose=args.verbose)
     if args.verbose:
-        print("\nStarting boxart conversion...")
+        print("Starting boxart conversion...")
     if asset.import_image(args.image, AssetType.Boxart, verbose=args.verbose):
         output_path = f"GC{args.titleid}.asset"
         if asset.save_asset(output_path, verbose=args.verbose):
-            print(f"\nCreated boxart asset: {output_path}")
+            if args.verbose:
+                print(f"Created boxart asset: {output_path}")
+            else:
+                print(f"Created boxart asset: {os.path.basename(output_path)}")
         else:
-            print("\nFailed to save boxart asset")
+            print("Failed to save boxart asset")
     else:
-        print("\nFailed to import boxart image")
+
+        print("Failed to import boxart image")
 
 def handle_screenshots(args):
     asset = AuroraAssetFile()
@@ -311,36 +373,44 @@ def handle_screenshots(args):
         try:
             asset_type = AssetType(AssetType.Screenshot1 + idx)
             if not asset.import_image(image, asset_type):
-                print(f"\nFailed to import screenshot {idx + 1}")
+                print(f"Failed to import screenshot {idx + 1}")
                 return
         except ValueError:
-            print(f"\nError: Too many screenshots. Maximum is {AssetType.ScreenshotEnd - AssetType.ScreenshotStart + 1}")
+            print(f"Error: Too many screenshots. Maximum is {AssetType.ScreenshotEnd - AssetType.ScreenshotStart + 1}")
             return
     
     output_path = f"SS{args.titleid}.asset"
     if asset.save_asset(output_path):
-        print(f"\nCreated screenshots asset with {len(args.images)} screenshots: {output_path}")
+        if args.verbose:
+            print(f"Created screenshots asset with {len(args.images)} screenshots: {output_path}")
+        else:
+            print(f"Created screenshots asset with {len(args.images)} screenshots: {os.path.basename(output_path)}")
     else:
-        print("\nFailed to save screenshots asset")
+        print("Failed to save screenshots asset")
+
 
 def handle_bannericon(args):
     asset = AuroraAssetFile()
     
     # Import banner
     if not asset.import_image(args.banner, AssetType.Banner):
-        print("\nFailed to import banner image")
+        print("Failed to import banner image")
         return
     
     # Import icon
     if not asset.import_image(args.icon, AssetType.Icon):
-        print("\nFailed to import icon image")
+        print("Failed to import icon image")
         return
     
     output_path = f"GL{args.titleid}.asset"
     if asset.save_asset(output_path):
-        print(f"\nCreated banner/icon asset: {output_path}")
+        if args.verbose:
+            print(f"Created banner/icon asset: {output_path}")
+        else:
+            print(f"Created banner/icon asset: {os.path.basename(output_path)}")
     else:
-        print("\nFailed to save banner/icon asset")
+        print("Failed to save banner/icon asset")
+
 
 def handle_folder(args):
     # Strip trailing backslashes from the folder path
@@ -392,8 +462,12 @@ def process_folder(folder_path: str, titleid: str, verbose: bool = False, overwr
             if boxart_asset.import_image(os.path.join(folder_path, boxart_file), AssetType.Boxart, verbose=verbose):
                 output_path = os.path.join(output_folder, f"GC{titleid}.asset")
                 if boxart_asset.save_asset(output_path, verbose=verbose):
-                    print(f"\nCreated boxart asset: {output_path}")
+                    if verbose:
+                        print(f"Created boxart asset: {output_path}")
+                    else:
+                        print(f"Created boxart asset: {os.path.basename(output_path)}")
                     assets_created = True
+
 
     # Process Background
     if should_process_asset('BK'):
@@ -403,8 +477,12 @@ def process_folder(folder_path: str, titleid: str, verbose: bool = False, overwr
             if background_asset.import_image(os.path.join(folder_path, background_file), AssetType.Background, verbose=verbose):
                 output_path = os.path.join(output_folder, f"BK{titleid}.asset")
                 if background_asset.save_asset(output_path, verbose=verbose):
-                    print(f"\nCreated background asset: {output_path}")
+                    if verbose:
+                        print(f"Created background asset: {output_path}")
+                    else:
+                        print(f"Created background asset: {os.path.basename(output_path)}")
                     assets_created = True
+
 
     # Process Banner and Icon together
     if should_process_asset('GL'):
@@ -415,16 +493,20 @@ def process_folder(folder_path: str, titleid: str, verbose: bool = False, overwr
         if banner_file and icon_file:
             # Import banner
             if not gl_asset.import_image(os.path.join(folder_path, banner_file), AssetType.Banner, verbose=verbose):
-                print("\nFailed to import banner image")
+                print("Failed to import banner image")
             # Import icon
             elif not gl_asset.import_image(os.path.join(folder_path, icon_file), AssetType.Icon, verbose=verbose):
-                print("\nFailed to import icon image")
+                print("Failed to import icon image")
             else:
                 output_path = os.path.join(output_folder, f"GL{titleid}.asset")
                 if gl_asset.save_asset(output_path, verbose=verbose):
-                    print(f"\nCreated banner/icon asset: {output_path}")
+                    if verbose:
+                        print(f"Created banner/icon asset: {output_path}")
+                    else:
+                        print(f"Created banner/icon asset: {os.path.basename(output_path)}")
                     assets_created = True
         else:
+
             if verbose:
                 if not banner_file:
                     print("No banner image found")
@@ -440,7 +522,7 @@ def process_folder(folder_path: str, titleid: str, verbose: bool = False, overwr
                 try:
                     asset_type = AssetType(AssetType.Screenshot1 + idx)
                     if not screenshot_asset.import_image(os.path.join(folder_path, filename), asset_type, verbose=verbose):
-                        print(f"\nFailed to import screenshot {idx + 1}")
+                        print(f"Failed to import screenshot {idx + 1}")
                         break
                 except ValueError:
                     print(f"Warning: Too many screenshots, skipping {filename}")
@@ -448,8 +530,12 @@ def process_folder(folder_path: str, titleid: str, verbose: bool = False, overwr
             else:
                 output_path = os.path.join(output_folder, f"SS{titleid}.asset")
                 if screenshot_asset.save_asset(output_path, verbose=verbose):
-                    print(f"\nCreated screenshots asset with {len(screenshot_files)} screenshots: {output_path}")
+                    if verbose:
+                        print(f"Created screenshots asset with {len(screenshot_files)} screenshots: {output_path}")
+                    else:
+                        print(f"Created screenshots asset with {len(screenshot_files)} screenshots: {os.path.basename(output_path)}")
                     assets_created = True
+
 
     if not assets_created:
         print("No valid assets found in folder or all assets already exist.")
@@ -528,6 +614,60 @@ def extract_asset(asset_path: str, output_format: str = "png", verbose: bool = F
     else:
         print(f"Error: Unknown asset prefix '{prefix}'. Expected BK, GC, GL, or SS.")
 
+def create_texture_header(width: int, height: int, format_code: int = 0x31545844) -> bytes:
+    """Create a 52-byte texture header with proper format"""
+    header = bytearray(52)
+    
+    # Format from working files
+    header[0:4] = struct.pack('<I', 0x03)  # Format version
+    header[4:8] = struct.pack('<I', 0x01)  # Unknown constant
+    header[8:12] = struct.pack('<I', 0)    # Reserved
+    header[12:16] = struct.pack('<I', 0)   # Reserved
+    header[16:20] = struct.pack('<I', 0)   # Reserved
+    header[20:24] = b'\xff\xff\x00\x00'    # Width mask
+    header[24:28] = b'\xff\xff\x00\x00'    # Height mask
+    header[28:32] = struct.pack('<I', format_code)  # DXT format
+    header[32:36] = struct.pack('<I', 0x54)  # Constant
+    header[36:40] = struct.pack('<I', 0)    # Reserved
+    header[40:44] = struct.pack('<I', 0x100d)  # Flags
+    header[44:48] = struct.pack('<I', 0)    # Reserved
+    header[48:52] = struct.pack('<I', 0x0a)  # Constant
+
+    return header
+
+def write_entry(file, entry_data, width, height, extended_info=0x00030001):
+    # Write entry header
+    file.write(struct.pack('<I', 0x120))  # Offset to texture data
+    file.write(struct.pack('<H', width))  # Width
+    file.write(struct.pack('<H', height))  # Height
+    file.write(struct.pack('>I', extended_info))  # Extended info (big-endian)
+    # Padding to 64 bytes
+    file.write(b'\x00' * (64 - 12))
+
+def write_asset_file(output_path, entries):
+    with open(output_path, 'wb') as f:
+        # Write 256 byte header
+        f.write(b'\x00' * 256)
+        
+        # Write entries (25 entries * 64 bytes = 1600 bytes)
+        for entry in entries:
+            write_entry(f, *entry)
+        
+        # Pad to 2048 bytes
+        f.write(b'\x00' * (2048 - 256 - 1600))
+        
+        # Write texture data
+        for entry in entries:
+            dds_header = create_texture_header(entry[1], entry[2], entry[3])  # entry[3] indicates alpha
+            f.write(dds_header)
+            f.write(entry[4])  # Texture data
+
+def validate_texture_dimensions(width, height):
+    if width < 64 or height < 64:
+        raise ValueError(f"Invalid texture dimensions {width}x{height}")
+    if width & (width - 1) != 0 or height & (height - 1) != 0:
+        raise ValueError(f"Texture dimensions must be power of two: {width}x{height}")
+
 def main():
     parser = argparse.ArgumentParser(
         description='Aurora Asset Converter',
@@ -539,7 +679,7 @@ def main():
               '  convert.py bannericon --banner banner.png --icon icon.png 00000001',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument('--version', action='version', version='%(prog)s 1.0.1')
+    parser.add_argument('--version', action='version', version='%(prog)s 1.0.2')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
     subparsers = parser.add_subparsers(dest='command', required=True)
     
