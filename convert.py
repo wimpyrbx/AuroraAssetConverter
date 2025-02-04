@@ -271,6 +271,8 @@ def create_folder_parser(subparsers):
     parser = subparsers.add_parser('folder', help='Process all assets in a folder')
     parser.add_argument('folder', help='Path to folder containing assets')
     parser.add_argument('titleid', help='Title ID for the game')
+    parser.add_argument('--overwrite', action='store_true', default=False,
+                      help='Overwrite existing asset files (default: False)')
     parser.set_defaults(func=handle_folder)
 
 def create_extract_parser(subparsers):
@@ -343,77 +345,115 @@ def handle_bannericon(args):
 def handle_folder(args):
     # Strip trailing backslashes from the folder path
     folder_path = args.folder.rstrip('\\')
-    process_folder(folder_path, args.titleid, verbose=args.verbose)
+    process_folder(folder_path, args.titleid, verbose=args.verbose, overwrite=args.overwrite)
 
-def process_folder(folder_path: str, titleid: str, verbose: bool = False):
+def process_folder(folder_path: str, titleid: str, verbose: bool = False, overwrite: bool = False):
     # Create output subfolder
     output_folder = os.path.join(folder_path, titleid)
     os.makedirs(output_folder, exist_ok=True)
     
-    # Map of filename patterns to asset types
-    file_patterns = {
-        'background.*': AssetType.Background,
-        'banner.*': AssetType.Banner,
-        'boxart.*': AssetType.Boxart,
-        'icon.*': AssetType.Icon,
-    }
-    
-    # Process each asset type separately
+    # Initialize assets_created flag
     assets_created = False
     
+    # Function to check if we should process an asset
+    def should_process_asset(prefix):
+        output_path = os.path.join(output_folder, f"{prefix}{titleid}.asset")
+        if not overwrite and os.path.exists(output_path):
+            # if we are not overwriting but the file exists and is below 10kb we should process regardless of overwrite flag
+            if os.path.getsize(output_path) < 10240 and verbose:
+                print(f"Skipping {prefix} asset - file already exists but is below 10kb")
+                return True
+            if verbose:
+                print(f"Skipping {prefix} asset - file already exists")
+            return False
+        return True
+
+    # Function to find asset files
+    def find_asset_file(base_name):
+        # Try exact matches first
+        for ext in ['png', 'webp', 'jpg']:  # Added JPG as last resort
+            filename = f"{base_name}.{ext}"
+            if filename in os.listdir(folder_path):
+                return filename
+        
+        # Try numbered versions
+        for ext in ['png', 'webp', 'jpg']:  # Added JPG as last resort
+            matches = [f for f in os.listdir(folder_path) 
+                      if f.lower().startswith(f"{base_name}_001") and f.lower().endswith(f".{ext}")]
+            if matches:
+                return matches[0]
+        return None
+
     # Process Boxart
-    boxart_asset = AuroraAssetFile(verbose=verbose)
-    matches = [f for f in os.listdir(folder_path) if re.match('boxart.*', f, re.IGNORECASE)]
-    if matches:
-        if boxart_asset.import_image(os.path.join(folder_path, matches[0]), AssetType.Boxart, verbose=verbose):
-            output_path = os.path.join(output_folder, f"GC{titleid}.asset")
-            if boxart_asset.save_asset(output_path, verbose=verbose):
-                print(f"\nCreated boxart asset: {output_path}")
-                assets_created = True
+    if should_process_asset('GC'):
+        boxart_asset = AuroraAssetFile(verbose=verbose)
+        boxart_file = find_asset_file('boxart')
+        if boxart_file:
+            if boxart_asset.import_image(os.path.join(folder_path, boxart_file), AssetType.Boxart, verbose=verbose):
+                output_path = os.path.join(output_folder, f"GC{titleid}.asset")
+                if boxart_asset.save_asset(output_path, verbose=verbose):
+                    print(f"\nCreated boxart asset: {output_path}")
+                    assets_created = True
 
     # Process Background
-    background_asset = AuroraAssetFile(verbose=verbose)
-    matches = [f for f in os.listdir(folder_path) if re.match('background.*', f, re.IGNORECASE)]
-    if matches:
-        if background_asset.import_image(os.path.join(folder_path, matches[0]), AssetType.Background, verbose=verbose):
-            output_path = os.path.join(output_folder, f"BK{titleid}.asset")
-            if background_asset.save_asset(output_path, verbose=verbose):
-                print(f"\nCreated background asset: {output_path}")
-                assets_created = True
+    if should_process_asset('BK'):
+        background_asset = AuroraAssetFile(verbose=verbose)
+        background_file = find_asset_file('background')
+        if background_file:
+            if background_asset.import_image(os.path.join(folder_path, background_file), AssetType.Background, verbose=verbose):
+                output_path = os.path.join(output_folder, f"BK{titleid}.asset")
+                if background_asset.save_asset(output_path, verbose=verbose):
+                    print(f"\nCreated background asset: {output_path}")
+                    assets_created = True
 
-    # Process Icon and Banner
-    icon_banner_asset = AuroraAssetFile(verbose=verbose)
-    icon_matches = [f for f in os.listdir(folder_path) if re.match('icon.*', f, re.IGNORECASE)]
-    banner_matches = [f for f in os.listdir(folder_path) if re.match('banner.*', f, re.IGNORECASE)]
-    if icon_matches and banner_matches:
-        if (icon_banner_asset.import_image(os.path.join(folder_path, icon_matches[0]), AssetType.Icon, verbose=verbose) and
-            icon_banner_asset.import_image(os.path.join(folder_path, banner_matches[0]), AssetType.Banner, verbose=verbose)):
-            output_path = os.path.join(output_folder, f"GL{titleid}.asset")
-            if icon_banner_asset.save_asset(output_path, verbose=verbose):
-                print(f"\nCreated icon/banner asset: {output_path}")
-                assets_created = True
+    # Process Banner and Icon together
+    if should_process_asset('GL'):
+        gl_asset = AuroraAssetFile(verbose=verbose)
+        banner_file = find_asset_file('banner')
+        icon_file = find_asset_file('icon')
+        
+        if banner_file and icon_file:
+            # Import banner
+            if not gl_asset.import_image(os.path.join(folder_path, banner_file), AssetType.Banner, verbose=verbose):
+                print("\nFailed to import banner image")
+            # Import icon
+            elif not gl_asset.import_image(os.path.join(folder_path, icon_file), AssetType.Icon, verbose=verbose):
+                print("\nFailed to import icon image")
+            else:
+                output_path = os.path.join(output_folder, f"GL{titleid}.asset")
+                if gl_asset.save_asset(output_path, verbose=verbose):
+                    print(f"\nCreated banner/icon asset: {output_path}")
+                    assets_created = True
+        else:
+            if verbose:
+                if not banner_file:
+                    print("No banner image found")
+                if not icon_file:
+                    print("No icon image found")
 
     # Process Screenshots
-    screenshot_asset = AuroraAssetFile(verbose=verbose)
-    screenshot_files = sorted([f for f in os.listdir(folder_path) if f.lower().startswith('screenshot')])
-    if screenshot_files:
-        for idx, filename in enumerate(screenshot_files):
-            try:
-                asset_type = AssetType(AssetType.Screenshot1 + idx)
-                if not screenshot_asset.import_image(os.path.join(folder_path, filename), asset_type, verbose=verbose):
-                    print(f"\nFailed to import screenshot {idx + 1}")
+    if should_process_asset('SS'):
+        screenshot_asset = AuroraAssetFile(verbose=verbose)
+        screenshot_files = sorted([f for f in os.listdir(folder_path) if f.lower().startswith('screenshot')])
+        if screenshot_files:
+            for idx, filename in enumerate(screenshot_files):
+                try:
+                    asset_type = AssetType(AssetType.Screenshot1 + idx)
+                    if not screenshot_asset.import_image(os.path.join(folder_path, filename), asset_type, verbose=verbose):
+                        print(f"\nFailed to import screenshot {idx + 1}")
+                        break
+                except ValueError:
+                    print(f"Warning: Too many screenshots, skipping {filename}")
                     break
-            except ValueError:
-                print(f"Warning: Too many screenshots, skipping {filename}")
-                break
-        else:
-            output_path = os.path.join(output_folder, f"SS{titleid}.asset")
-            if screenshot_asset.save_asset(output_path, verbose=verbose):
-                print(f"\nCreated screenshots asset with {len(screenshot_files)} screenshots: {output_path}")
-                assets_created = True
+            else:
+                output_path = os.path.join(output_folder, f"SS{titleid}.asset")
+                if screenshot_asset.save_asset(output_path, verbose=verbose):
+                    print(f"\nCreated screenshots asset with {len(screenshot_files)} screenshots: {output_path}")
+                    assets_created = True
 
     if not assets_created:
-        print("No valid assets found in folder")
+        print("No valid assets found in folder or all assets already exist.")
+
 
 def handle_extract(args):
     extract_asset(args.asset, args.format, verbose=args.verbose)
@@ -499,7 +539,7 @@ def main():
               '  convert.py bannericon --banner banner.png --icon icon.png 00000001',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument('--version', action='version', version='%(prog)s 1.0')
+    parser.add_argument('--version', action='version', version='%(prog)s 1.0.1')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
     subparsers = parser.add_subparsers(dest='command', required=True)
     

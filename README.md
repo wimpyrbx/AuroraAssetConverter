@@ -63,9 +63,19 @@ python convert.py extract 4D5308DE.asset output.png
 python convert.py folder /path/to/assets 4D5308DE
 ```
 Output .asset files will be placed in a subfolder named `<titleid>` within the source folder so in this example it would be `/path/to/assets/4D5308DE/`
+This will use all matching images in the source folder and convert into .asset files:
+* boxart.{png,jpg,webp} or boxart_001.{png,jpg,webp}
+* banner.{png,jpg,webp} or banner_001.{png,jpg,webp}
+* icon.{png,jpg,webp} or icon_001.{png,jpg,webp}
+* background.{png,jpg,webp} or background_001.{png,jpg,webp}
+* screenshot1.{png,jpg,webp}, screenshot2.{png,jpg,webp}, screenshot3.{png,jpg,webp} (no alternative _001 suffix for these)
+
+Optional argument for folder `--overwrite` can be used to overwrite existing files .asset files in target folder.
+
 
 
 ### Available commands
+
 - `background`: Convert background image
 - `boxart`: Convert boxart image
 - `screenshots`: Convert multiple screenshots
